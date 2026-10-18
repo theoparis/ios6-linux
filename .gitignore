@@ -1,0 +1,13 @@
+work/
+artifacts/
+*.ipsw
+*.dsc
+10B329__*/
+/target/
+/build/
+*.o
+*.a
+__pycache__/
+*.core
+/tweaks
+kernelcache.release.ios6

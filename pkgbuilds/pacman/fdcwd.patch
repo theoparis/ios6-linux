@@ -1,0 +1,35 @@
+diff --git a/lib/libalpm/util.c b/lib/libalpm/util.c
+index 6739161b..b330ce71 100644
+--- a/lib/libalpm/util.c
++++ b/lib/libalpm/util.c
+@@ -39,6 +39,10 @@
+ #include <pwd.h>
+ #include <signal.h>
+ 
++#ifndef MSG_NOSIGNAL
++#define MSG_NOSIGNAL 0
++#endif
++
+ /* libarchive */
+ #include <archive.h>
+ #include <archive_entry.h>
+@@ -1488,11 +1492,19 @@ int _alpm_access(alpm_handle_t *handle, const char *dir, const char *file, int a
+ 		CALLOC(check_path, len, sizeof(char), RET_ERR(handle, ALPM_ERR_MEMORY, -1));
+ 		snprintf(check_path, len, "%s%s", dir, file);
+ 
++#if defined(HAVE_FACCESSAT) && defined(AT_FDCWD)
+ 		ret = faccessat(AT_FDCWD, check_path, amode, flag);
++#else
++		ret = access(check_path, amode);
++#endif
+ 		free(check_path);
+ 	} else {
+ 		dir = "";
++#if defined(HAVE_FACCESSAT) && defined(AT_FDCWD)
+ 		ret = faccessat(AT_FDCWD, file, amode, flag);
++#else
++		ret = access(file, amode);
++#endif
+ 	}
+ 
+ 	if(ret != 0) {
