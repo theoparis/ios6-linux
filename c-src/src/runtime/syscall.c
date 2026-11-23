@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <fcntl.h>
@@ -194,6 +195,12 @@ int runtime_patch_for_cache(guest_arena_t *arena) {
     uint32_t *code = (uint32_t *)guest_arena_to_host(arena, ERRNO_SETTER_CODE_ADDR);
     uint32_t *cell = (uint32_t *)guest_arena_to_host(arena, CACHE_CERROR_ERRNO_CELL);
     if (!code || !cell) return -1;
+    // The cell lives inside the mapped shared cache; ensure the page is writable
+    // (cache layout differs between builds, so the page may be unmapped/RX).
+    if (mprotect((void *)((uintptr_t)cell & ~0xfffULL), 4096, PROT_READ | PROT_WRITE) != 0) {
+        fprintf(stderr, "runtime_patch_for_cache: cannot make errno cell page writable\n");
+        return -1;
+    }
     code[0] = 0xEE1D1F70;
     code[1] = 0xE5911000;
     code[2] = 0xE5810000 | PTHREAD_ERRNO_OFFSET;

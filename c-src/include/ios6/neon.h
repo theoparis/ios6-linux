@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * Interpreted VFP / NEON data-processing.
  *
@@ -38,5 +42,9 @@ typedef struct {
 /* Returns false if the instruction is not supported (caller warns at compile time). */
 bool neon_supported(const neon_op_t *op);
 void neon_exec(uint32_t *gtc, const neon_op_t *op);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

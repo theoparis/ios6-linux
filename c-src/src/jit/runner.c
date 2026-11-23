@@ -31,9 +31,8 @@ int jit_runner_init(jit_runner_t *runner, guest_arena_t *arena,
         return -1;
     }
 
-    init_jit(NULL);
-    runner->_jit = jit_new_state();
-    if (!runner->_jit) {
+    runner->engine = codegen_engine_create();
+    if (!runner->engine) {
         disasm_destroy(&runner->dis);
         return -1;
     }
@@ -42,11 +41,9 @@ int jit_runner_init(jit_runner_t *runner, guest_arena_t *arena,
 }
 
 void jit_runner_destroy(jit_runner_t *runner) {
-    if (runner->_jit) {
-        jit_state_t *_jit = runner->_jit;
-        jit_destroy_state();
-        finish_jit();
-        runner->_jit = NULL;
+    if (runner->engine) {
+        codegen_engine_destroy(runner->engine);
+        runner->engine = NULL;
     }
     disasm_destroy(&runner->dis);
 }
@@ -78,7 +75,7 @@ jit_block_fn jit_runner_get_or_compile(jit_runner_t *runner, uint32_t pc) {
         return NULL;
     }
 
-    jit_block_fn fn = codegen_compile_block(runner->_jit, &bb, runner->slide);
+    jit_block_fn fn = codegen_compile_block(runner->engine, &bb, runner->slide);
     if (!fn) {
         fprintf(stderr, "jit_runner: codegen failed for block at 0x%08x\n", pc);
         return NULL;

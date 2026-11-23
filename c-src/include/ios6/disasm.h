@@ -5,6 +5,10 @@
 #include <capstone/capstone.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define MAX_BLOCK_INSNS 512
 
 typedef struct {
@@ -45,5 +49,9 @@ arm_cc invert_arm_cc(arm_cc cc);
 /* Strip a trailing condition-code suffix (e.g. "popeq" -> "pop") for non-branch insns. */
 void strip_cc_suffix(char *base_mn, arm_cc cc);
 uint32_t get_pc_value(uint32_t insn_addr, arm_mode_t mode);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* IOS6_DISASM_H */

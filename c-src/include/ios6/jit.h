@@ -4,7 +4,7 @@
 #include "ios6/context.h"
 #include "ios6/guestmem.h"
 #include "ios6/disasm.h"
-#include <lightning.h>
+#include "ios6/llvmjit.h"
 
 #define BLOCK_CACHE_CAPACITY 65536
 
@@ -18,7 +18,7 @@ typedef struct {
 typedef struct {
     guest_arena_t *arena;
     disassembler_t dis;
-    jit_state_t *_jit;
+    llvmjit_engine_t *engine;
     block_cache_entry_t cache[BLOCK_CACHE_CAPACITY];
     uint32_t gtc[GTC_NUM_FIELDS];
     arm_mode_t mode;

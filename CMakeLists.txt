@@ -1,8 +1,19 @@
-cmake_minimum_required(VERSION 3.16)
-project(ios6_jit_c C)
+cmake_minimum_required(VERSION 3.25)
+project(ios6_jit_c C CXX)
+
+# Host toolchain: clang (required before project()).
+if (NOT DEFINED CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER clang)
+endif ()
+if (NOT DEFINED CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER clang++)
+endif ()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(
     -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
@@ -13,30 +24,32 @@ add_compile_options(
     -DHAVE_ISINF=1
 )
 
-include_directories(
-    c-src/include
-    submodules/lightning/include
-)
+include_directories(c-src/include)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(CAPSTONE REQUIRED capstone)
 
-# Lightning core sources
-set(LIGHTNING_SRCS
-    submodules/lightning/lib/lightning.c
-    submodules/lightning/lib/jit_memory.c
-    submodules/lightning/lib/jit_size.c
-    submodules/lightning/lib/jit_note.c
-    submodules/lightning/lib/jit_print.c
-    submodules/lightning/lib/jit_disasm.c
-)
+# LLVM 23 (needed by TPDE-LLVM)
+find_package(LLVM 23.1 REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
 
-# Project library
+# TPDE (LLVM back-end + JIT mapper); built as part of this build.
+set(TPDE_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
+set(TPDE_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(TPDE_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(TPDE_ENABLE_COVERAGE OFF CACHE BOOL "" FORCE)
+set(TPDE_ENABLE_ASAN OFF CACHE BOOL "" FORCE)
+set(TPDE_ENABLE_PCH OFF CACHE BOOL "" FORCE)
+set(TPDE_ENABLE_EH OFF CACHE BOOL "" FORCE)
+set(TPDE_TARGETS "x86_64" CACHE STRING "" FORCE)
+set(TPDE_LINK_LLVM_STATIC OFF CACHE BOOL "" FORCE)
+add_subdirectory(submodules/tpde)
+
+# Core sources
 add_library(ios6_jit_core STATIC
-    ${LIGHTNING_SRCS}
     c-src/src/guestmem/arena.c
     c-src/src/jit/disasm.c
-    c-src/src/jit/codegen.c
+    c-src/src/jitllvm/lifter.cpp
     c-src/src/jit/neon.c
     c-src/src/jit/runner.c
     c-src/src/jit/c_api.c
@@ -49,6 +62,8 @@ add_library(ios6_jit_core STATIC
 
 target_link_libraries(ios6_jit_core PUBLIC
     ${CAPSTONE_LIBRARIES}
+    tpde_llvm
+    LLVM
     dl
     m
     pthread

@@ -148,7 +148,16 @@ int main(int argc, char **argv) {
     multi_resolver_ctx_t resolver_ctx = {0};
 
     // If dyld shared cache exists, map it in
-    const char *dsc_path = "/home/theo/.cache/dmgref/BrightonMaps10B329.K93OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7";
+    static char dsc_buf[1024];
+    const char *dsc_path = getenv("IOS6_DSC");
+    if (!dsc_path) {
+        const char *root = getenv("IOS6_ROOT");
+        if (root) {
+            snprintf(dsc_buf, sizeof dsc_buf, "%s/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7", root);
+            dsc_path = dsc_buf;
+        }
+    }
+    if (!dsc_path) dsc_path = "/home/theo/.cache/dmgref/BrightonMaps10B329.K93OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7";
     shared_cache_t *cache = (shared_cache_t *)malloc(sizeof(shared_cache_t));
     if (cache && shared_cache_open(cache, dsc_path) == 0) {
         printf("Found iOS 6 dyld shared cache! Mapping into arena...\n");
@@ -201,6 +210,11 @@ int main(int argc, char **argv) {
             // Call guest snprintf(buf, 64, fmt, "XY", 42) and show the result.
             uint32_t fn = shared_cache_resolve(cache, "/usr/lib/libSystem.B.dylib", "_snprintf");
             uint32_t scratch = 0x21009c00;
+            if (mprotect((void *)((uintptr_t)guest_arena_to_host(&arena, scratch) & ~0xfffULL),
+                         0x2000, PROT_READ | PROT_WRITE) != 0) {
+                fprintf(stderr, "SELFTEST: cannot map scratch page\n");
+                return 1;
+            }
             char *h = (char *)guest_arena_to_host(&arena, scratch);
             const char *fmt = getenv("IOS6_SELFTEST");
             if (!*fmt || !strcmp(fmt, "1")) fmt = "a%sb%dc|%5d|%x";

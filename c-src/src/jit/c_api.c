@@ -1,13 +1,12 @@
 #include "ios6/c_api.h"
 #include "ios6/codegen.h"
 #include "ios6/disasm.h"
-#include <lightning.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 typedef struct {
     disassembler_t dis;
-    jit_state_t *_jit;
+    llvmjit_engine_t *engine;
 } c_jit_t;
 
 c_jit_engine_t c_jit_create(void) {
@@ -19,9 +18,8 @@ c_jit_engine_t c_jit_create(void) {
         return NULL;
     }
 
-    init_jit(NULL);
-    j->_jit = jit_new_state();
-    if (!j->_jit) {
+    j->engine = codegen_engine_create();
+    if (!j->engine) {
         disasm_destroy(&j->dis);
         free(j);
         return NULL;
@@ -33,10 +31,8 @@ c_jit_engine_t c_jit_create(void) {
 void c_jit_destroy(c_jit_engine_t engine) {
     if (!engine) return;
     c_jit_t *j = (c_jit_t *)engine;
-    if (j->_jit) {
-        jit_state_t *_jit = j->_jit;
-        jit_destroy_state();
-        finish_jit();
+    if (j->engine) {
+        codegen_engine_destroy(j->engine);
     }
     disasm_destroy(&j->dis);
     free(j);
@@ -57,5 +53,5 @@ c_block_fn_t c_jit_compile_block(c_jit_engine_t engine,
         return NULL;
     }
 
-    return (c_block_fn_t)codegen_compile_block(j->_jit, &bb, slide);
+    return (c_block_fn_t)codegen_compile_block(j->engine, &bb, slide);
 }
