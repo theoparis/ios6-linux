@@ -48,11 +48,15 @@ typedef struct {
 } segment_command_32_t;
 
 #define MAX_SEGMENTS 32
+#define MAX_DYLIBS 64
 
 typedef struct {
     mach_header_32_t header;
     uint32_t slide;
     guest_addr_t base_addr;
+    char dylibs[MAX_DYLIBS][256]; /* install names of the dylib load commands, in ordinal order */
+    size_t dylib_count;
+    char path[512];            /* file the image was loaded from, as given to macho_load_file */
     guest_addr_t entry_point;
     size_t segment_count;
     segment_command_32_t segments[MAX_SEGMENTS];
@@ -62,7 +66,12 @@ typedef struct {
     size_t lazy_bind_size;
 } loaded_image_t;
 
-typedef uint32_t (*symbol_resolver_fn)(const char *name, void *user_data);
+/*
+ * Resolves a bound symbol. `dylib` is the install name of the library the image's two-level
+ * binding names (its dylib ordinal), or NULL for self / main executable / flat lookup.
+ * Returns 0 when the symbol cannot be found.
+ */
+typedef uint32_t (*symbol_resolver_fn)(const char *name, const char *dylib, void *user_data);
 
 int macho_load_file(guest_arena_t *arena,
                     const char *path,

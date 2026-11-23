@@ -15,9 +15,17 @@ typedef struct {
     loaded_image_t *alpm_image;
 } multi_resolver_ctx_t;
 
-static uint32_t multi_resolver(const char *name, void *user_data) {
+static uint32_t multi_resolver(const char *name, const char *dylib, void *user_data) {
     multi_resolver_ctx_t *ctx = (multi_resolver_ctx_t *)user_data;
 
+    // 0. Two-level namespace: the library the binding names (re-exports followed by the cache)
+    if (dylib && ctx && ctx->cache) {
+        uint32_t a = shared_cache_resolve(ctx->cache, dylib, name);
+        if (a != 0) {
+            if (getenv("IOS6_TRACE_BIND")) fprintf(stderr, "bind %s -> %s 0x%08x\n", name, dylib, a);
+            return a;
+        }
+    }
     // 1. Shared cache (real iOS libSystem) takes priority
     if (ctx && ctx->cache) {
         uint32_t c_addr = shared_cache_resolve(ctx->cache, "/usr/lib/libSystem.B.dylib", name);
@@ -197,6 +205,7 @@ int main(int argc, char **argv) {
     printf("Loaded image successfully: base=0x%08x entry_point=0x%08x (slide=0x%08x)\n",
            image.base_addr, image.entry_point, image.slide);
     dyld_register_image(&image);
+    dyld_build_image_list(&arena, cache, &image);
 
     uint32_t sp = 0, argv_addr = 0;
     runtime_setup_stack(&arena, argc - 1, &argv[1], &sp, &argv_addr);

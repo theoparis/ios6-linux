@@ -54,10 +54,9 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     fault_hex(r ? r->block_pc : 0);
     fault_write("\n  host address: ");
     fault_hex(addr);
-    if (r && addr >= (uintptr_t)r->arena->base &&
-        addr - (uintptr_t)r->arena->base < GUEST_SPACE_LIMIT) {
+    if (addr < GUEST_SPACE_LIMIT) { // guest_arena_to_host is the identity mapping
         fault_write("\n  guest address: ");
-        fault_hex(addr - (uintptr_t)r->arena->base);
+        fault_hex(addr);
     }
     if (r) {
         fault_write("\n  regs:");

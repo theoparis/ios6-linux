@@ -146,10 +146,84 @@ static void apply_rebase(guest_arena_t *arena,
     }
 }
 
+/* The dylib a bind's ordinal names, or NULL for self / main executable / flat lookup. */
+static const char *dylib_for_ordinal(const loaded_image_t *image, int64_t ordinal) {
+    if (ordinal < 1) return NULL;
+    if ((uint64_t)ordinal > image->dylib_count) {
+        fprintf(stderr, "dyld: %s: bind names dylib ordinal %lld, image has %zu dylibs\n",
+                image->path, (long long)ordinal, image->dylib_count);
+        exit(1);
+    }
+    return image->dylibs[ordinal - 1];
+}
+
+typedef struct {
+    size_t seg_index;
+    uint32_t seg_offset;
+    const char *symbol_name;
+    const char *dylib;
+    bool weak;
+    int64_t addend;
+} bind_state_t;
+
+/* Resolves the state's symbol; a missing non-weak symbol is fatal, as in dyld. */
+static uint32_t bind_resolve(const loaded_image_t *image, symbol_resolver_fn resolver,
+                             void *user_data, const bind_state_t *s) {
+    uint32_t resolved = resolver(s->symbol_name, s->dylib, user_data);
+    if (resolved == 0 && !s->weak) {
+        fprintf(stderr, "dyld: Symbol not found: %s\n  Referenced from: %s\n  Expected in: %s\n",
+                s->symbol_name, image->path, s->dylib ? s->dylib : "flat namespace");
+        exit(1);
+    }
+    return resolved;
+}
+
+static void bind_store(guest_arena_t *arena, const loaded_image_t *image, const bind_state_t *s,
+                       uint32_t offset, uint32_t resolved) {
+    if (resolved == 0 || s->seg_index >= image->segment_count) return;
+    uint32_t *slot = (uint32_t *)guest_arena_to_host(arena,
+        image->segments[s->seg_index].vmaddr + image->slide + offset);
+    if (slot) *slot = resolved + (uint32_t)s->addend;
+}
+
+/* Consumes one opcode that only updates `s`; returns false for DO_BIND*, DONE and unknowns. */
+static bool bind_set_state(const loaded_image_t *image, bind_state_t *s, uint8_t opcode, uint8_t imm,
+                           const uint8_t **p, const uint8_t *end) {
+    switch (opcode) {
+        case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
+            s->dylib = dylib_for_ordinal(image, imm);
+            return true;
+        case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+            s->dylib = NULL;
+            return true;
+        case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
+            s->dylib = dylib_for_ordinal(image, (int64_t)read_uleb128(p, end));
+            return true;
+        case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+            s->symbol_name = (const char *)*p;
+            s->weak = (imm & 1) != 0; // BIND_SYMBOL_FLAGS_WEAK_IMPORT
+            while (*p < end && **p != '\0') (*p)++;
+            if (*p < end) (*p)++; // Skip null byte
+            return true;
+        case BIND_OPCODE_SET_TYPE_IMM:
+            return true;
+        case BIND_OPCODE_SET_ADDEND_SLEB:
+            s->addend = read_sleb128(p, end);
+            return true;
+        case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+            s->seg_index = imm;
+            s->seg_offset = (uint32_t)read_uleb128(p, end);
+            return true;
+        case BIND_OPCODE_ADD_ADDR_ULEB:
+            s->seg_offset += (uint32_t)read_uleb128(p, end);
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void apply_bind(guest_arena_t *arena,
-                       const segment_command_32_t *segs,
-                       size_t seg_count,
-                       uint32_t slide,
+                       const loaded_image_t *image,
                        const uint8_t *opcodes,
                        size_t len,
                        symbol_resolver_fn resolver,
@@ -157,96 +231,38 @@ static void apply_bind(guest_arena_t *arena,
     if (len == 0 || !resolver) return;
     const uint8_t *p = opcodes;
     const uint8_t *end = opcodes + len;
-
-    size_t seg_index = 0;
-    uint32_t seg_offset = 0;
-    const char *symbol_name = "";
-    int64_t addend = 0;
+    bind_state_t s = { .symbol_name = "" };
 
     while (p < end) {
         uint8_t byte = *p++;
         uint8_t opcode = byte & BIND_OPCODE_MASK;
         uint8_t imm = byte & BIND_IMMEDIATE_MASK;
+        if (bind_set_state(image, &s, opcode, imm, &p, end)) continue;
 
         switch (opcode) {
-            case BIND_OPCODE_DONE:
+            case BIND_OPCODE_DO_BIND:
+                bind_store(arena, image, &s, s.seg_offset, bind_resolve(image, resolver, user_data, &s));
+                s.seg_offset += 4;
                 break;
-            case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
-            case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+            case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
+                bind_store(arena, image, &s, s.seg_offset, bind_resolve(image, resolver, user_data, &s));
+                s.seg_offset += 4 + (uint32_t)read_uleb128(&p, end);
                 break;
-            case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
-                read_uleb128(&p, end);
+            case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
+                bind_store(arena, image, &s, s.seg_offset, bind_resolve(image, resolver, user_data, &s));
+                s.seg_offset += 4 + imm * 4;
                 break;
-            case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: {
-                symbol_name = (const char *)p;
-                while (p < end && *p != '\0') p++;
-                if (p < end) p++; // Skip null byte
-                break;
-            }
-            case BIND_OPCODE_SET_TYPE_IMM:
-                break;
-            case BIND_OPCODE_SET_ADDEND_SLEB:
-                addend = read_sleb128(&p, end);
-                break;
-            case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
-                seg_index = imm;
-                seg_offset = (uint32_t)read_uleb128(&p, end);
-                break;
-            case BIND_OPCODE_ADD_ADDR_ULEB:
-                seg_offset += (uint32_t)read_uleb128(&p, end);
-                break;
-            case BIND_OPCODE_DO_BIND: {
-                if (seg_index < seg_count && strlen(symbol_name) > 0) {
-                    uint32_t resolved = resolver(symbol_name, user_data);
-                    if (resolved != 0) {
-                        uint32_t addr = segs[seg_index].vmaddr + slide + seg_offset;
-                        uint32_t *target = (uint32_t *)guest_arena_to_host(arena, addr);
-                        if (target) *target = resolved + (uint32_t)addend;
-                    }
-                }
-                seg_offset += 4;
-                break;
-            }
-            case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB: {
-                if (seg_index < seg_count && strlen(symbol_name) > 0) {
-                    uint32_t resolved = resolver(symbol_name, user_data);
-                    if (resolved != 0) {
-                        uint32_t addr = segs[seg_index].vmaddr + slide + seg_offset;
-                        uint32_t *target = (uint32_t *)guest_arena_to_host(arena, addr);
-                        if (target) *target = resolved + (uint32_t)addend;
-                    }
-                }
-                seg_offset += 4 + (uint32_t)read_uleb128(&p, end);
-                break;
-            }
-            case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED: {
-                if (seg_index < seg_count && strlen(symbol_name) > 0) {
-                    uint32_t resolved = resolver(symbol_name, user_data);
-                    if (resolved != 0) {
-                        uint32_t addr = segs[seg_index].vmaddr + slide + seg_offset;
-                        uint32_t *target = (uint32_t *)guest_arena_to_host(arena, addr);
-                        if (target) *target = resolved + (uint32_t)addend;
-                    }
-                }
-                seg_offset += 4 + imm * 4;
-                break;
-            }
-            case 0xC0: { // BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+            case BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB: {
                 uint64_t count = read_uleb128(&p, end);
                 uint32_t skip = (uint32_t)read_uleb128(&p, end);
-                uint32_t resolved = (seg_index < seg_count && strlen(symbol_name) > 0)
-                                        ? resolver(symbol_name, user_data) : 0;
+                uint32_t resolved = bind_resolve(image, resolver, user_data, &s);
                 for (uint64_t i = 0; i < count; i++) {
-                    if (resolved != 0) {
-                        uint32_t addr = segs[seg_index].vmaddr + slide + seg_offset;
-                        uint32_t *target = (uint32_t *)guest_arena_to_host(arena, addr);
-                        if (target) *target = resolved + (uint32_t)addend;
-                    }
-                    seg_offset += 4 + skip;
+                    bind_store(arena, image, &s, s.seg_offset, resolved);
+                    s.seg_offset += 4 + skip;
                 }
                 break;
             }
-            default:
+            default: // DONE
                 break;
         }
     }
@@ -259,54 +275,20 @@ uint32_t macho_lazy_bind(const loaded_image_t *image, guest_arena_t *arena,
     if (!image->lazy_bind || lazy_offset >= image->lazy_bind_size) return 0;
     const uint8_t *p = image->lazy_bind + lazy_offset;
     const uint8_t *end = image->lazy_bind + image->lazy_bind_size;
-    size_t seg_index = 0;
-    uint32_t seg_offset = 0;
-    const char *symbol_name = "";
-    int64_t addend = 0;
+    bind_state_t s = { .symbol_name = "" };
 
     while (p < end) {
         uint8_t byte = *p++;
         uint8_t opcode = byte & BIND_OPCODE_MASK;
         uint8_t imm = byte & BIND_IMMEDIATE_MASK;
+        if (bind_set_state(image, &s, opcode, imm, &p, end)) continue;
+        if (opcode != BIND_OPCODE_DO_BIND) return 0; // DONE, or an opcode a lazy entry never uses
 
-        switch (opcode) {
-            case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
-            case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
-            case BIND_OPCODE_SET_TYPE_IMM:
-                break;
-            case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
-                read_uleb128(&p, end);
-                break;
-            case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
-                symbol_name = (const char *)p;
-                while (p < end && *p != '\0') p++;
-                if (p < end) p++;
-                break;
-            case BIND_OPCODE_SET_ADDEND_SLEB:
-                addend = read_sleb128(&p, end);
-                break;
-            case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
-                seg_index = imm;
-                seg_offset = (uint32_t)read_uleb128(&p, end);
-                break;
-            case BIND_OPCODE_ADD_ADDR_ULEB:
-                seg_offset += (uint32_t)read_uleb128(&p, end);
-                break;
-            case BIND_OPCODE_DO_BIND: {
-                *out_name = symbol_name;
-                if (seg_index >= image->segment_count) return 0;
-                uint32_t resolved = resolver(symbol_name, user_data);
-                if (resolved == 0) return 0;
-                uint32_t target = resolved + (uint32_t)addend;
-                uint32_t *slot = (uint32_t *)guest_arena_to_host(arena,
-                    image->segments[seg_index].vmaddr + image->slide + seg_offset);
-                if (!slot) return 0;
-                *slot = target;
-                return target;
-            }
-            default:
-                return 0; // DONE, or an opcode a lazy entry never uses
-        }
+        *out_name = s.symbol_name;
+        uint32_t resolved = bind_resolve(image, resolver, user_data, &s);
+        if (resolved == 0 || s.seg_index >= image->segment_count) return 0;
+        bind_store(arena, image, &s, s.seg_offset, resolved);
+        return resolved + (uint32_t)s.addend;
     }
     return 0;
 }
@@ -320,6 +302,7 @@ int macho_load_file(guest_arena_t *arena,
     if (!f) return -1;
 
     memset(out_image, 0, sizeof(*out_image));
+    snprintf(out_image->path, sizeof out_image->path, "%s", path);
 
     if (fread(&out_image->header, sizeof(mach_header_32_t), 1, f) != 1) {
         fclose(f);
@@ -365,6 +348,19 @@ int macho_load_file(guest_arena_t *arena,
         } else if (cmd == LC_UNIXTHREAD) {
             fseek(f, cmd_start + 40 + 60, SEEK_SET); // thread state pc offset
             fread(&unix_entry, 4, 1, f);
+        } else if (cmd == 0xc /* LC_LOAD_DYLIB */ || cmd == 0x80000018 /* LC_LOAD_WEAK_DYLIB */ ||
+                   cmd == 0x8000001f /* LC_REEXPORT_DYLIB */ || cmd == 0x80000023 /* LC_LOAD_UPWARD_DYLIB */) {
+            uint32_t name_off = 0;
+            if (out_image->dylib_count == MAX_DYLIBS || fread(&name_off, 4, 1, f) != 1 ||
+                name_off >= cmdsize) {
+                fclose(f);
+                return -1;
+            }
+            char *dst = out_image->dylibs[out_image->dylib_count++];
+            fseek(f, cmd_start + name_off, SEEK_SET);
+            size_t n = cmdsize - name_off < 255 ? cmdsize - name_off : 255;
+            n = fread(dst, 1, n, f);
+            dst[n] = '\0';
         }
 
         fseek(f, cmd_start + cmdsize, SEEK_SET);
@@ -451,7 +447,7 @@ int macho_load_file(guest_arena_t *arena,
         uint8_t *bind_buf = malloc(bind_size);
         fseek(f, bind_off, SEEK_SET);
         fread(bind_buf, bind_size, 1, f);
-        apply_bind(arena, out_image->segments, out_image->segment_count, slide, bind_buf, bind_size, resolver, user_data);
+        apply_bind(arena, out_image, bind_buf, bind_size, resolver, user_data);
         free(bind_buf);
     }
 

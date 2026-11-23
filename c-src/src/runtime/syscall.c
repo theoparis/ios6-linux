@@ -114,7 +114,7 @@ static const char *s_host_functions[] = {
     "__NSGetMachExecuteHeader",
     "__dyld_fast_stub_entry",
     "__dyld_register_func_for_add_image",
-    "__ios6_dyld_add_image_continue",
+    "__ios6_dyld_callback_continue",
     NULL
 };
 
@@ -155,7 +155,13 @@ int runtime_install_stubs(guest_arena_t *arena, host_stubs_t *stubs) {
     // Commpage at 0xffff0000
     guest_arena_mprotect(arena, 0xffff0000, 0x4000, PROT_READ | PROT_WRITE);
     void *commpage = guest_arena_to_host(arena, 0xffff0000);
-    if (commpage) memset(commpage, 0, 0x4000);
+    if (commpage) {
+        memset(commpage, 0, 0x4000);
+        // _COMM_PAGE_{ACTIVE,PHYSICAL,LOGICAL}_CPUS (0xffff1034..6): one CPU, read by libdispatch
+        ((uint8_t *)commpage)[0x1034] = 1;
+        ((uint8_t *)commpage)[0x1035] = 1;
+        ((uint8_t *)commpage)[0x1036] = 1;
+    }
 
     // Install trampoline code: `svc #0x80; b .` in Thumb mode (0xdf80, 0xe7fe)
     uint8_t tramp_code[6] = { 0x80, 0xdf, 0xfe, 0xe7, 0x00, 0xbf };
@@ -298,8 +304,27 @@ int runtime_handle_trampoline(guest_arena_t *arena, uint32_t *gtc) {
     } else if (strcmp(fn, "__dyld_register_func_for_add_image") == 0) {
         dyld_register_add_image(gtc, gtc[GTC_R0]); // sets NEXT_PC itself
         return 0;
-    } else if (strcmp(fn, "__ios6_dyld_add_image_continue") == 0) {
-        dyld_add_image_continue(gtc);
+    } else if (strcmp(fn, "__dyld_dyld_register_image_state_change_handler") == 0) {
+        dyld_register_state_handler(gtc, gtc[GTC_R0], gtc[GTC_R1], gtc[GTC_R2]); // sets NEXT_PC itself
+        return 0;
+    } else if (strcmp(fn, "__dyld_register_func_for_remove_image") == 0) {
+        // Images are never unloaded, so the callback can never fire.
+    } else if (strcmp(fn, "__dyld_image_count") == 0) {
+        gtc[GTC_R0] = dyld_image_count();
+    } else if (strcmp(fn, "__dyld_get_image_header") == 0) {
+        gtc[GTC_R0] = dyld_image_header(gtc[GTC_R0]);
+    } else if (strcmp(fn, "__dyld_get_image_name") == 0) {
+        gtc[GTC_R0] = dyld_image_name(gtc[GTC_R0]);
+    } else if (strcmp(fn, "__dyld_get_image_vmaddr_slide") == 0) {
+        gtc[GTC_R0] = dyld_image_slide(gtc[GTC_R0]);
+    } else if (strcmp(fn, "__dyld_get_image_slide") == 0) {
+        gtc[GTC_R0] = dyld_image_slide_for_header(gtc[GTC_R0]);
+    } else if (strcmp(fn, "__dyld_image_path_containing_address") == 0) {
+        gtc[GTC_R0] = dyld_image_path_containing(gtc[GTC_R0]);
+    } else if (strcmp(fn, "__dyld_dlopen") == 0) {
+        gtc[GTC_R0] = dyld_dlopen((const char *)guest_arena_to_host(arena, gtc[GTC_R0]), gtc[GTC_R1]);
+    } else if (strcmp(fn, "__ios6_dyld_callback_continue") == 0) {
+        dyld_callback_continue(gtc);
         return 0;
     } else if (strcmp(fn, "_getopt") == 0) {
         gtc[GTC_R0] = (uint32_t)-1; // No more options
@@ -392,7 +417,9 @@ int runtime_handle_trampoline(guest_arena_t *arena, uint32_t *gtc) {
     } else if (strcmp(fn, "__NSGetMachExecuteHeader") == 0) {
         gtc[GTC_R0] = PROCESS_INFO_BASE + 12;
     } else {
-        gtc[GTC_R0] = 0;
+        fprintf(stderr, "ios6: host function %s (called from 0x%08x) is not implemented\n",
+                fn, gtc[GTC_LR]);
+        exit(1);
     }
 
     // Return to caller via LR
@@ -402,6 +429,22 @@ int runtime_handle_trampoline(guest_arena_t *arena, uint32_t *gtc) {
 
 #define FAKE_PORT_BASE 0x1000
 #define MIG_OOL_PORTS_ADDR 0x21009800u /* guest scratch for out-of-line port arrays */
+
+/* Next address handed out for anywhere-allocations (mmap, vm_allocate, vm_map). */
+static uint32_t s_vm_bump = 0x24000000;
+
+static uint32_t vm_reserve(guest_arena_t *arena, uint32_t addr, uint32_t size, uint32_t mask, bool anywhere) {
+    size = (size + 4095) & ~4095u;
+    if (anywhere) {
+        uint32_t align = mask > 4095 ? mask + 1 : 4096;
+        addr = (s_vm_bump + align - 1) & ~(align - 1);
+        s_vm_bump = addr + size;
+    }
+    if (getenv("IOS6_TRACE_SYS")) fprintf(stderr, "vm_reserve: 0x%x size 0x%x (anywhere=%d)\n", addr, size, anywhere);
+    if (guest_arena_mprotect(arena, addr, size, PROT_READ | PROT_WRITE) != 0) return 0;
+    memset(guest_arena_to_host(arena, addr), 0, size);
+    return addr;
+}
 
 static void dispatch_mach_trap(guest_arena_t *arena, uint32_t trap, uint32_t *gtc) {
     switch (trap) {
@@ -462,6 +505,46 @@ static void dispatch_mach_trap(guest_arena_t *arena, uint32_t trap, uint32_t *gt
                 header[10] = 0;                            // RetCode = KERN_SUCCESS
                 header[11] = 1;                            // NDR int_rep (little-endian)
                 header[12] = 1;                            // inline port count, read by the MIG stub
+                gtc[GTC_R0] = 0;
+            } else if (header && (header[5] == 3812 || header[5] == 3801)) {
+                // vm_map(task, &addr, size, mask, flags, object, offset, copy, cur, max, inherit)
+                // vm_allocate(task, &addr, size, flags). Reply: header, NDR, RetCode, address.
+                bool is_map = header[5] == 3812;
+                if (is_map && header[7] != 0) {
+                    fprintf(stderr, "ios6: vm_map of a memory object (port 0x%x) is not supported\n", header[7]);
+                    exit(1);
+                }
+                if (getenv("IOS6_TRACE_SYS")) {
+                    fprintf(stderr, "vm req:");
+                    for (int k = 0; k < 22; k++) fprintf(stderr, " %x", header[k]);
+                    fprintf(stderr, "\n");
+                }
+                uint32_t addr = header[is_map ? 12 : 8];
+                uint32_t size = header[is_map ? 13 : 9];
+                uint32_t mask = is_map ? header[14] : 0;
+                uint32_t flags = header[is_map ? 15 : 10];
+                uint32_t got = vm_reserve(arena, addr, size, mask, (flags & 1 /* VM_FLAGS_ANYWHERE */) != 0);
+                uint32_t id = header[5];
+                memset(header, 0, 40);
+                header[0] = 0x12;
+                header[1] = 40;
+                header[5] = id + 100;
+                header[7] = 1;                         // NDR int_rep (little-endian)
+                header[8] = got ? 0 : 3;               // KERN_SUCCESS / KERN_NO_SPACE
+                header[9] = got;
+                gtc[GTC_R0] = 0;
+            } else if (header && header[5] == 1000) { // clock_get_time(clock, &cur_time)
+                // Reply: header, NDR, RetCode, mach_timespec {tv_sec, tv_nsec}.
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                memset(header, 0, 44);
+                header[0] = 0x12;
+                header[1] = 44;
+                header[5] = 1100;
+                header[7] = 1;                         // NDR int_rep (little-endian)
+                header[8] = 0;                         // RetCode = KERN_SUCCESS
+                header[9] = (uint32_t)ts.tv_sec;
+                header[10] = (uint32_t)ts.tv_nsec;
                 gtc[GTC_R0] = 0;
             } else if (header) {
                 // Generic MIG routine: reply {header, NDR, RetCode = KERN_SUCCESS}
@@ -707,12 +790,12 @@ int runtime_handle_syscall(guest_arena_t *arena, uint32_t *gtc) {
             break;
         }
         case 197: { // SYS_mmap
-            static uint32_t mmap_bump = 0x24000000;
+            uint32_t *bump = &s_vm_bump;
             uint32_t req = gtc[GTC_R0] & ~4095u;
             size_t len = (gtc[GTC_R1] + 4095) & ~4095u;
             int prot_bits = (int)gtc[GTC_R2];
-            uint32_t addr = (req != 0) ? req : mmap_bump;
-            if (req == 0) mmap_bump += (uint32_t)len;
+            uint32_t addr = (req != 0) ? req : *bump;
+            if (req == 0) *bump += (uint32_t)len;
 
             int prot = PROT_EXEC;
             if (prot_bits & 1) prot |= PROT_READ;
@@ -729,16 +812,105 @@ int runtime_handle_syscall(guest_arena_t *arena, uint32_t *gtc) {
             }
             break;
         }
+        case 336: { // SYS_proc_info(callnum, pid, flavor, uint64 arg = r3:r4, buffer = r5, buffersize = r6)
+            // Only proc_pidinfo(PROC_PIDT_SHORTBSDINFO) is provided, as libdispatch asks for it.
+            if (gtc[GTC_R0] != 2 || gtc[GTC_R2] != 13 || gtc[6] < 64) {
+                fprintf(stderr, "ios6: proc_info(call=%u, flavor=%u, size=%u) is not supported\n",
+                        gtc[GTC_R0], gtc[GTC_R2], gtc[6]);
+                exit(1);
+            }
+            uint32_t *info = (uint32_t *)guest_arena_to_host(arena, gtc[5]);
+            memset(info, 0, 64); // struct proc_bsdshortinfo
+            info[0] = (uint32_t)getpid();   // pbsi_pid
+            info[1] = (uint32_t)getppid();  // pbsi_ppid
+            info[2] = (uint32_t)getpgrp();  // pbsi_pgid
+            info[3] = 2;                    // pbsi_status: SRUN
+            info[9] = (uint32_t)getuid();   // pbsi_uid
+            gtc[GTC_R0] = 64;               // bytes written
+            gtc[GTC_FIELD_CPSR] &= ~CPSR_C;
+            break;
+        }
+        /* Workqueue support: probed by libdispatch; there are no worker threads to hand work to. */
+        case 367: // SYS_workq_open
+            gtc[GTC_R0] = 0;
+            gtc[GTC_FIELD_CPSR] &= ~CPSR_C;
+            break;
+        case 368: // SYS_workq_kernreturn(options, item, affinity, prio)
+            if (gtc[GTC_R0] != 0x10 /* WQOPS_QUEUE_NEWSPISUPP: probe for the SPI */) {
+                fprintf(stderr, "ios6: workq_kernreturn(options=0x%x) is not supported: no worker threads\n",
+                        gtc[GTC_R0]);
+                exit(1);
+            }
+            gtc[GTC_R0] = 0;
+            gtc[GTC_FIELD_CPSR] &= ~CPSR_C;
+            break;
+        /*
+         * kqueue / kevent: there is no host kqueue and no second thread to wait for events, so
+         * the queue is an fd that accepts every registration and never fires an event.
+         */
+        case 362: // SYS_kqueue
+            set_result(gtc, open("/dev/null", O_RDONLY));
+            break;
+        case 363: // SYS_kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
+        case 369: { // SYS_kevent64(kq, changelist, nchanges, eventlist, nevents, flags, timeout)
+            bool k64 = sysno == 369;
+            // struct kevent is 5 words {ident, filter:16|flags:16, fflags, data, udata};
+            // kevent64_s is 12 words {ident64, filter|flags, fflags, data64, udata64, ext[2]}.
+            uint32_t words = k64 ? 12 : 5, data_word = k64 ? 4 : 3;
+            uint32_t nchanges = gtc[GTC_R2], nevents = gtc[4];
+            uint32_t timeout_ptr = gtc[k64 ? 6 : 5];
+            const uint32_t *changes = (const uint32_t *)guest_arena_to_host(arena, gtc[GTC_R1]);
+            uint32_t *events = (uint32_t *)guest_arena_to_host(arena, gtc[GTC_R3]);
+            const uint32_t *timeout = timeout_ptr ? (const uint32_t *)guest_arena_to_host(arena, timeout_ptr) : NULL;
+            uint32_t flag_word = k64 ? 2 : 1;
+            uint32_t out = 0;
+            for (uint32_t i = 0; i < nchanges && out < nevents; i++) {
+                const uint32_t *ch = changes + i * words;
+                if (!((ch[flag_word] >> 16) & 0x40 /* EV_RECEIPT */)) continue;
+                memcpy(events + out * words, ch, words * 4);
+                events[out * words + flag_word] |= 0x4000u << 16; // EV_ERROR with data 0: change succeeded
+                events[out * words + data_word] = 0;
+                if (k64) events[out * words + 5] = 0;
+                out++;
+            }
+            if (out == 0 && nevents > 0) {
+                if (!timeout) {
+                    fprintf(stderr, "ios6: kevent would block forever: no event source can fire\n");
+                    exit(1);
+                }
+                struct timespec ts = { .tv_sec = (time_t)timeout[0], .tv_nsec = (long)timeout[1] };
+                nanosleep(&ts, NULL);
+            }
+            gtc[GTC_R0] = out;
+            gtc[GTC_FIELD_CPSR] &= ~CPSR_C;
+            break;
+        }
         case 327: // SYS_issetugid
             gtc[GTC_R0] = 0;
             gtc[GTC_FIELD_CPSR] &= ~CPSR_C;
             break;
         case 372: // SYS_thread_selfid (iOS 6 numbering) -> uint64 tid in r0:r1
-        case 423:
             gtc[GTC_R0] = 0x101;
             gtc[GTC_R1] = 0;
             gtc[GTC_FIELD_CPSR] &= ~CPSR_C;
             break;
+        case 420: // SYS___semwait_signal(cond_sem, mutex_sem, timeout, relative, tv_sec, tv_nsec)
+        case 423: { // SYS___semwait_signal_nocancel; sleep() and nanosleep() are built on it
+            if (!gtc[GTC_R2]) {
+                fprintf(stderr, "ios6: __semwait_signal(0x%x) would block forever: no other thread can signal it\n",
+                        gtc[GTC_R0]);
+                exit(1);
+            }
+            struct timespec ts = { .tv_sec = (time_t)gtc[4], .tv_nsec = (long)gtc[5] };
+            if (gtc[GTC_R3]) { // relative
+                nanosleep(&ts, NULL);
+            } else {
+                clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL);
+            }
+            gtc[GTC_R0] = 60; // ETIMEDOUT: the timeout elapsed
+            gtc[GTC_FIELD_CPSR] |= CPSR_C;
+            break;
+        }
         /* ---- filesystem (paths mapped into IOS6_ROOT) ---- */
 #define GPATH(reg, buf) guest_path((const char *)guest_arena_to_host(arena, gtc[reg]), buf, sizeof buf)
         case 136: { char b[1024]; set_result(gtc, mkdir(GPATH(0, b), (mode_t)gtc[1])); break; }

@@ -55,6 +55,8 @@ struct BlockCtx {
     Value *gtc_word(unsigned word) { return b.CreateGEP(b.getInt32Ty(), gtc, b.getInt32(word)); }
     Value *ld(unsigned reg) { return b.CreateLoad(b.getInt32Ty(), gtc_word(reg)); }
     void st(unsigned reg, Value *v) { b.CreateStore(b.CreateTrunc(v, b.getInt32Ty()), gtc_word(reg)); }
+    /* ALUWritePC: Thumb ALU writes to PC branch without changing instruction set. */
+    Value *alu_write_pc(Value *target) { return thumb ? b.CreateOr(target, 1) : target; }
     Value *ld_next_pc() { return ld(GTC_FIELD_NEXT_PC); }
     void st_next_pc(Value *v) { st(GTC_FIELD_NEXT_PC, v); }
     void st_next_pc_imm(uint32_t imm) { b.CreateStore(b.getInt32(imm), gtc_word(GTC_FIELD_NEXT_PC)); }
@@ -758,7 +760,7 @@ static bool lift_insn(BlockCtx &c, Function *neon_exec,
     if (!strcmp(base_mn, "mov") || !strcmp(base_mn, "movs") || !strcmp(base_mn, "movw")) {
         int rd = arm_reg_to_num(d->operands[0].reg);
         Value *v = resolve_operand(c, &d->operands[1], pc_val);
-        if (rd == 15) c.st_next_pc(v);
+        if (rd == 15) c.st_next_pc(c.alu_write_pc(v));
         else if (rd >= 0) c.st(rd, v);
         if (insn->update_flags || !strcmp(base_mn, "movs")) nz_flags(c, v);
         return true;
@@ -788,7 +790,7 @@ static bool lift_insn(BlockCtx &c, Function *neon_exec,
         bool flags = insn->update_flags || base_mn[strlen(base_mn) - 1] == 's';
         Value *r = base_mn[0] == 'a' ? c.b.CreateAdd(x, y) : c.b.CreateSub(x, y);
         int rd = arm_reg_to_num(d->operands[0].reg);
-        if (rd == 15) c.st_next_pc(r);
+        if (rd == 15) c.st_next_pc(c.alu_write_pc(r));
         else if (rd >= 0) c.st(rd, r);
         if (flags) {
             if (base_mn[0] == 'a') add_flags(c, x, y, r);
@@ -853,6 +855,21 @@ static bool lift_insn(BlockCtx &c, Function *neon_exec,
         bool flags_only = base_mn[0] == 't';
         if (!flags_only) c.st(arm_reg_to_num(d->operands[0].reg), r);
         if (insn->update_flags || flags_only) nz_flags(c, r);
+        return true;
+    }
+    // ---- RRX: rotate right with extend through C ----
+    if (one_of("rrx", "rrxs")) {
+        Value *x = resolve_operand(c, &d->operands[1], pc_val);
+        Value *cin = c.b.CreateAnd(c.ld_cpsr(), CPSR_C); // already at bit 29
+        Value *r = c.b.CreateOr(c.b.CreateLShr(x, 1), c.b.CreateShl(cin, 2)); // C -> bit 31
+        if (insn->update_flags || base_mn[3] == 's') {
+            nz_flags(c, r);
+            Value *cbit = c.b.CreateShl(c.b.CreateAnd(x, 1), 29);
+            c.st_cpsr(c.b.CreateOr(c.b.CreateAnd(c.ld_cpsr(), (uint32_t)~CPSR_C), cbit));
+        }
+        int rd = arm_reg_to_num(d->operands[0].reg);
+        if (rd == 15) c.st_next_pc(c.alu_write_pc(r));
+        else c.st(rd, r);
         return true;
     }
     // ---- Shifts ----
