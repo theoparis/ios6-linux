@@ -401,6 +401,7 @@ int runtime_handle_trampoline(guest_arena_t *arena, uint32_t *gtc) {
 }
 
 #define FAKE_PORT_BASE 0x1000
+#define MIG_OOL_PORTS_ADDR 0x21009800u /* guest scratch for out-of-line port arrays */
 
 static void dispatch_mach_trap(guest_arena_t *arena, uint32_t trap, uint32_t *gtc) {
     switch (trap) {
@@ -444,6 +445,23 @@ static void dispatch_mach_trap(guest_arena_t *arena, uint32_t trap, uint32_t *gt
                 header[8] = 0;                         // RetCode = KERN_SUCCESS
                 header[9] = count;
                 memcpy(&header[10], info, count * 4);
+                gtc[GTC_R0] = 0;
+            } else if (header && header[5] == 3404) { // mach_ports_lookup(task, &ports, &count)
+                // Complex reply: header, one out-of-line ports descriptor, NDR, RetCode.
+                uint32_t reply_id = header[5] + 100;
+                uint32_t *ports = (uint32_t *)guest_arena_to_host(arena, MIG_OOL_PORTS_ADDR);
+                ports[0] = FAKE_PORT_BASE + 5;             // same port task_get_special_port returns
+                memset(header, 0, 52);
+                header[0] = 0x80000012;                    // MACH_MSGH_BITS_COMPLEX | reply bits
+                header[1] = 52;                            // msgh_size
+                header[5] = reply_id;                      // msgh_id = request + 100
+                header[6] = 1;                             // descriptor count
+                header[7] = MIG_OOL_PORTS_ADDR;            // ool_ports.address
+                header[8] = 1;                             // ool_ports.count
+                header[9] = (17u << 16) | (2u << 24);      // pad:16, disposition MOVE_SEND, type OOL_PORTS
+                header[10] = 0;                            // RetCode = KERN_SUCCESS
+                header[11] = 1;                            // NDR int_rep (little-endian)
+                header[12] = 1;                            // inline port count, read by the MIG stub
                 gtc[GTC_R0] = 0;
             } else if (header) {
                 // Generic MIG routine: reply {header, NDR, RetCode = KERN_SUCCESS}

@@ -23,6 +23,7 @@ typedef struct {
     uint32_t gtc[GTC_NUM_FIELDS];
     arm_mode_t mode;
     uint32_t slide;
+    uint32_t block_pc; /* guest start of the block being executed, for fault reports */
 } jit_runner_t;
 
 int jit_runner_init(jit_runner_t *runner, guest_arena_t *arena,

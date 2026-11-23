@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
 
 static uint32_t hash_pc(uint32_t pc, arm_mode_t mode) {
     uint32_t h = pc ^ ((uint32_t)mode << 31);
@@ -14,6 +16,69 @@ static uint32_t hash_pc(uint32_t pc, arm_mode_t mode) {
     h *= 0xc2b2ae35;
     h ^= h >> 16;
     return h & (BLOCK_CACHE_CAPACITY - 1);
+}
+
+/* Host SIGSEGV/SIGBUS while running guest code: report where the guest was, then let the
+ * default action terminate the process. Only async-signal-safe calls. */
+static jit_runner_t *s_fault_runner;
+
+static void fault_write(const char *s) { (void)!write(2, s, strlen(s)); }
+
+static void fault_hex(uint64_t v) {
+    char buf[24];
+    char *p = buf + sizeof buf - 1;
+    *p = '\0';
+    do {
+        unsigned d = (unsigned)(v & 0xf);
+        *--p = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        v >>= 4;
+    } while (v);
+    *--p = 'x';
+    *--p = '0';
+    (void)!write(2, p, strlen(p));
+}
+
+static void fault_reg(const char *name, uint32_t v) {
+    fault_write(" ");
+    fault_write(name);
+    fault_write("=");
+    fault_hex(v);
+}
+
+static void fault_handler(int sig, siginfo_t *si, void *ctx) {
+    (void)ctx;
+    jit_runner_t *r = s_fault_runner;
+    uintptr_t addr = (uintptr_t)si->si_addr;
+    fault_write(sig == SIGBUS ? "\nios6: SIGBUS" : "\nios6: SIGSEGV");
+    fault_write(" while executing guest block at ");
+    fault_hex(r ? r->block_pc : 0);
+    fault_write("\n  host address: ");
+    fault_hex(addr);
+    if (r && addr >= (uintptr_t)r->arena->base &&
+        addr - (uintptr_t)r->arena->base < GUEST_SPACE_LIMIT) {
+        fault_write("\n  guest address: ");
+        fault_hex(addr - (uintptr_t)r->arena->base);
+    }
+    if (r) {
+        fault_write("\n  regs:");
+        fault_reg("r0", r->gtc[0]);
+        fault_reg("r1", r->gtc[1]);
+        fault_reg("r2", r->gtc[2]);
+        fault_reg("r3", r->gtc[3]);
+        fault_reg("sp", r->gtc[GTC_SP]);
+        fault_reg("lr", r->gtc[GTC_LR]);
+    }
+    fault_write("\n");
+}
+
+static void install_fault_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
 }
 
 int jit_runner_init(jit_runner_t *runner, guest_arena_t *arena,
@@ -37,10 +102,14 @@ int jit_runner_init(jit_runner_t *runner, guest_arena_t *arena,
         return -1;
     }
 
+    s_fault_runner = runner;
+    install_fault_handlers();
+
     return 0;
 }
 
 void jit_runner_destroy(jit_runner_t *runner) {
+    if (s_fault_runner == runner) s_fault_runner = NULL;
     if (runner->engine) {
         codegen_engine_destroy(runner->engine);
         runner->engine = NULL;
@@ -131,6 +200,7 @@ int jit_runner_step(jit_runner_t *runner) {
     }
 
     // Execute compiled block
+    runner->block_pc = pc;
     fn(runner->gtc);
     if (getenv("IOS6_TRACE") && getenv("IOS6_TRACE")[0] == '2') {
         printf("JIT Step: pc=0x%08x -> next_pc=0x%08x cpsr=%x", pc, runner->gtc[GTC_FIELD_NEXT_PC], runner->gtc[GTC_FIELD_CPSR]);
