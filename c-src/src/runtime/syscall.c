@@ -13,6 +13,7 @@
 #include <sys/statvfs.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include "ios6/dyld.h"
 
 static const char *s_host_functions[] = {
     "_getopt",
@@ -111,6 +112,9 @@ static const char *s_host_functions[] = {
     "_NSGetArgc",
     "_NSGetArgv",
     "__NSGetMachExecuteHeader",
+    "__dyld_fast_stub_entry",
+    "__dyld_register_func_for_add_image",
+    "__ios6_dyld_add_image_continue",
     NULL
 };
 
@@ -289,6 +293,14 @@ int runtime_handle_trampoline(guest_arena_t *arena, uint32_t *gtc) {
         if (getenv("IOS6_TRACE")) fprintf(stderr, "[dyld] func_lookup %s -> 0x%x\n", name ? name : "(null)", addr);
         if (addr && slot) { *slot = addr; gtc[GTC_R0] = 0; }
         else gtc[GTC_R0] = 1;
+    } else if (strcmp(fn, "__dyld_fast_stub_entry") == 0) {
+        gtc[GTC_R0] = dyld_fast_stub_entry(arena, gtc[GTC_R0], gtc[GTC_R1]);
+    } else if (strcmp(fn, "__dyld_register_func_for_add_image") == 0) {
+        dyld_register_add_image(gtc, gtc[GTC_R0]); // sets NEXT_PC itself
+        return 0;
+    } else if (strcmp(fn, "__ios6_dyld_add_image_continue") == 0) {
+        dyld_add_image_continue(gtc);
+        return 0;
     } else if (strcmp(fn, "_getopt") == 0) {
         gtc[GTC_R0] = (uint32_t)-1; // No more options
     } else if (strcmp(fn, "_setfsent") == 0) {

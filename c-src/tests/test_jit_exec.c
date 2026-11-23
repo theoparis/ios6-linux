@@ -49,6 +49,6 @@ int main() {
     assert(runner.gtc[GTC_FIELD_NEXT_PC] == 0x4000);
 
     jit_runner_destroy(&runner);
-    printf("C GNU Lightning JIT basic block execution PASSED!\n");
+    printf("C LLVM/TPDE JIT basic block execution PASSED!\n");
     return 0;
 }

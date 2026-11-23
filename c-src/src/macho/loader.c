@@ -252,6 +252,65 @@ static void apply_bind(guest_arena_t *arena,
     }
 }
 
+uint32_t macho_lazy_bind(const loaded_image_t *image, guest_arena_t *arena,
+                         symbol_resolver_fn resolver, void *user_data,
+                         uint32_t lazy_offset, const char **out_name) {
+    *out_name = "";
+    if (!image->lazy_bind || lazy_offset >= image->lazy_bind_size) return 0;
+    const uint8_t *p = image->lazy_bind + lazy_offset;
+    const uint8_t *end = image->lazy_bind + image->lazy_bind_size;
+    size_t seg_index = 0;
+    uint32_t seg_offset = 0;
+    const char *symbol_name = "";
+    int64_t addend = 0;
+
+    while (p < end) {
+        uint8_t byte = *p++;
+        uint8_t opcode = byte & BIND_OPCODE_MASK;
+        uint8_t imm = byte & BIND_IMMEDIATE_MASK;
+
+        switch (opcode) {
+            case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
+            case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+            case BIND_OPCODE_SET_TYPE_IMM:
+                break;
+            case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
+                read_uleb128(&p, end);
+                break;
+            case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+                symbol_name = (const char *)p;
+                while (p < end && *p != '\0') p++;
+                if (p < end) p++;
+                break;
+            case BIND_OPCODE_SET_ADDEND_SLEB:
+                addend = read_sleb128(&p, end);
+                break;
+            case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+                seg_index = imm;
+                seg_offset = (uint32_t)read_uleb128(&p, end);
+                break;
+            case BIND_OPCODE_ADD_ADDR_ULEB:
+                seg_offset += (uint32_t)read_uleb128(&p, end);
+                break;
+            case BIND_OPCODE_DO_BIND: {
+                *out_name = symbol_name;
+                if (seg_index >= image->segment_count) return 0;
+                uint32_t resolved = resolver(symbol_name, user_data);
+                if (resolved == 0) return 0;
+                uint32_t target = resolved + (uint32_t)addend;
+                uint32_t *slot = (uint32_t *)guest_arena_to_host(arena,
+                    image->segments[seg_index].vmaddr + image->slide + seg_offset);
+                if (!slot) return 0;
+                *slot = target;
+                return target;
+            }
+            default:
+                return 0; // DONE, or an opcode a lazy entry never uses
+        }
+    }
+    return 0;
+}
+
 int macho_load_file(guest_arena_t *arena,
                     const char *path,
                     symbol_resolver_fn resolver,
@@ -396,12 +455,16 @@ int macho_load_file(guest_arena_t *arena,
         free(bind_buf);
     }
 
+    // Lazy pointers stay unbound until their first call: each still points at its
+    // __stub_helper entry, and dyld_stub_binder binds it through macho_lazy_bind.
     if (lazy_bind_size > 0) {
-        uint8_t *lazy_buf = malloc(lazy_bind_size);
+        out_image->lazy_bind = malloc(lazy_bind_size);
         fseek(f, lazy_bind_off, SEEK_SET);
-        fread(lazy_buf, lazy_bind_size, 1, f);
-        apply_bind(arena, out_image->segments, out_image->segment_count, slide, lazy_buf, lazy_bind_size, resolver, user_data);
-        free(lazy_buf);
+        if (!out_image->lazy_bind || fread(out_image->lazy_bind, lazy_bind_size, 1, f) != 1) {
+            fclose(f);
+            return -1;
+        }
+        out_image->lazy_bind_size = lazy_bind_size;
     }
 
     // Parse export trie if present

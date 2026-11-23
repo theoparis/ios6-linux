@@ -60,6 +60,7 @@ def arm_tests():
           "sxtab r0, r2, r1", "uxtab r0, r2, r1", "uxtah r0, r2, r1", "sxtah r0, r2, r1",
           "ubfx r0, r1, #3, #7", "sbfx r0, r1, #3, #7", "ubfx r0, r1, #0, #32", "sbfx r0, r1, #31, #1",
           "bfi r0, r1, #4, #8", "bfi r0, r1, #0, #32", "bfc r0, #8, #8",
+          "pkhbt r0, r1, r2", "pkhbt r0, r1, r2, lsl #16", "pkhtb r0, r1, r2", "pkhtb r0, r1, r2, asr #7",
           "movw r0, #0xabcd", "movt r0, #0x1234"]
     # conditional execution of a few ops under every condition
     for c in CONDS:

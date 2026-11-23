@@ -57,6 +57,9 @@ typedef struct {
     size_t segment_count;
     segment_command_32_t segments[MAX_SEGMENTS];
     export_table_t exports;
+    /* Lazy-bind opcodes, kept for dyld's fast stub path (macho_lazy_bind). */
+    uint8_t *lazy_bind;
+    size_t lazy_bind_size;
 } loaded_image_t;
 
 typedef uint32_t (*symbol_resolver_fn)(const char *name, void *user_data);
@@ -66,5 +69,9 @@ int macho_load_file(guest_arena_t *arena,
                     symbol_resolver_fn resolver,
                     void *user_data,
                     loaded_image_t *out_image);
+
+uint32_t macho_lazy_bind(const loaded_image_t *image, guest_arena_t *arena,
+                         symbol_resolver_fn resolver, void *user_data,
+                         uint32_t lazy_offset, const char **out_name);
 
 #endif /* IOS6_MACHO_H */

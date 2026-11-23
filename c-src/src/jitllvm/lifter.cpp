@@ -554,6 +554,12 @@ static Value *rev32_bits(BlockCtx &c, Value *v) {
 // The per-insn lift switch (mirrors codegen_compile_block)
 // ---------------------------------------------------------------------------
 
+// Host side of an unsupported guest instruction; reached only when that instruction executes.
+static void ios6_unhandled_insn(const char *text, uint32_t pc) {
+    fprintf(stderr, "ios6: unsupported instruction at 0x%08x: %s\n", pc, text);
+    exit(1);
+}
+
 static bool lift_insn(BlockCtx &c, Function *neon_exec,
                       std::vector<std::unique_ptr<neon_op_t>> &ops,
                       const disassembled_insn_t *insn, uint32_t pc_val) {
@@ -961,6 +967,20 @@ static bool lift_insn(BlockCtx &c, Function *neon_exec,
         c.st(rd, v);
         return true;
     }
+    // ---- Pack halfword: PKHBT Rd,Rn,Rm{,LSL #n} / PKHTB Rd,Rn,Rm{,ASR #n} ----
+    if (one_of("pkhbt", "pkhtb")) {
+        int rd = arm_reg_to_num(d->operands[0].reg);
+        Value *rn = resolve_operand(c, &d->operands[1], pc_val);
+        Value *rm = resolve_operand(c, &d->operands[2], pc_val);
+        Value *v;
+        if (base_mn[3] == 'b') // pkhbt: bottom half from Rn, top half from shifted Rm
+            v = c.b.CreateOr(c.b.CreateAnd(rn, c.i32c(0x0000ffff)), c.b.CreateAnd(rm, c.i32c(0xffff0000)));
+        else                   // pkhtb: top half from Rn, bottom half from shifted Rm
+            v = c.b.CreateOr(c.b.CreateAnd(rn, c.i32c(0xffff0000)), c.b.CreateAnd(rm, c.i32c(0x0000ffff)));
+        c.st(rd, v);
+        return true;
+    }
+
     // ---- Bitfield: BFI / BFC / UBFX / SBFX ----
     if (one_of("bfi", "bfc")) {
         int rd = arm_reg_to_num(d->operands[0].reg);
@@ -1121,10 +1141,12 @@ static bool lift_insn(BlockCtx &c, Function *neon_exec,
     // ---- NOP family ----
     if (one_of("nop", "dmb", "dsb", "isb", "clrex", "yield", "pld", "pli")) return true;
     if (strcmp(base_mn, "it") && strncmp(base_mn, "it", 2)) {
-        static int warned;
-        if (warned++ < 64)
-            fprintf(stderr, "[codegen] unhandled insn at 0x%08x: %s %s\n",
-                    insn->address, insn->mnemonic, insn->op_str);
+        // Unsupported instruction: fail when it executes, instead of compiling nothing and
+        // running off the end of the block.
+        auto *fty = FunctionType::get(c.b.getVoidTy(), {c.b.getPtrTy(), c.b.getInt32Ty()}, false);
+        FunctionCallee unhandled = c.fn->getParent()->getOrInsertFunction("ios6_unhandled_insn", fty);
+        std::string text = std::string(insn->mnemonic) + " " + insn->op_str;
+        c.b.CreateCall(unhandled, {c.b.CreateGlobalString(text), c.i32c(insn->address)});
     }
     return true;
 }
@@ -1226,6 +1248,7 @@ jit_block_fn llvmjit_compile_block(llvmjit_engine_t *e, const basic_block_t *bb)
 
     auto mapper = e->compiler->compile_and_map(
         mod, +[](std::string_view name) -> void * {
+            if (name == "ios6_unhandled_insn") return (void *)&ios6_unhandled_insn;
             if (name == "neon_exec") return (void *)&::neon_exec;
             return dlsym(RTLD_DEFAULT, std::string(name).c_str());
         });

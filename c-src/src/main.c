@@ -4,6 +4,7 @@
 #include "ios6/runtime.h"
 #include "ios6/hooks.h"
 #include "ios6/jit.h"
+#include "ios6/dyld.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,7 +131,7 @@ int main(int argc, char **argv) {
         if (stat(rbuf, &rst) == 0) setenv("IOS6_ROOT", rbuf, 0);
     }
 
-    printf("=== iOS 6 C + GNU Lightning JIT Runner ===\n");
+    printf("=== iOS 6 C + LLVM/TPDE JIT Runner ===\n");
     printf("Initializing 4 GiB guest memory arena...\n");
 
     guest_arena_t arena;
@@ -146,6 +147,7 @@ int main(int argc, char **argv) {
     }
 
     multi_resolver_ctx_t resolver_ctx = {0};
+    dyld_init(multi_resolver, &resolver_ctx);
 
     // If dyld shared cache exists, map it in
     static char dsc_buf[1024];
@@ -179,6 +181,7 @@ int main(int argc, char **argv) {
         if (macho_load_file(&arena, alpm_path, multi_resolver, &resolver_ctx, &alpm_image) == 0) {
             printf("Loaded libalpm successfully at base 0x%08x\n", alpm_image.base_addr);
             resolver_ctx.alpm_image = &alpm_image;
+            dyld_register_image(&alpm_image);
         } else {
             fprintf(stderr, "Warning: failed to load %s\n", alpm_path);
         }
@@ -193,11 +196,12 @@ int main(int argc, char **argv) {
 
     printf("Loaded image successfully: base=0x%08x entry_point=0x%08x (slide=0x%08x)\n",
            image.base_addr, image.entry_point, image.slide);
+    dyld_register_image(&image);
 
     uint32_t sp = 0, argv_addr = 0;
     runtime_setup_stack(&arena, argc - 1, &argv[1], &sp, &argv_addr);
 
-    printf("Initializing GNU Lightning JIT compilation engine...\n");
+    printf("Initializing LLVM/TPDE JIT compilation engine...\n");
     jit_runner_t runner;
     if (jit_runner_init(&runner, &arena, image.entry_point, sp, image.slide) != 0) {
         fprintf(stderr, "Error: failed to initialize JIT runner\n");
@@ -244,7 +248,7 @@ int main(int argc, char **argv) {
     runner.gtc[GTC_R0] = (uint32_t)(argc - 1); // argc
     runner.gtc[GTC_R1] = argv_addr;            // argv
 
-    printf("Executing binary natively via GNU Lightning JIT from entry point 0x%08x...\n\n", image.entry_point);
+    printf("Executing binary via LLVM/TPDE JIT from entry point 0x%08x...\n\n", image.entry_point);
 
     int result = jit_runner_run(&runner, (size_t)-1);
     printf("\nExecution completed with result code: %d\n", result);

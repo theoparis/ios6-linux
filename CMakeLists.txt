@@ -57,6 +57,7 @@ add_library(ios6_jit_core STATIC
     c-src/src/macho/exports.c
     c-src/src/macho/shared_cache.c
     c-src/src/runtime/syscall.c
+    c-src/src/runtime/dyld.c
     c-src/src/runtime/hooks.c
 )
 
